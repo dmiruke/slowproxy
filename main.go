@@ -30,79 +30,102 @@ func main() {
 		log.Fatalf("listen: %v", err)
 	}
 
-	go func() {
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				log.Printf("accept: %v", err)
-				shutdown <- nil
-				return
-			}
-
-			forwardConn, err := net.Dial("tcp", forward)
-			if err != nil {
-				log.Printf("dial: %v", err)
-				if err := conn.Close(); err != nil {
-					log.Printf("conn.close: %v", err)
-				}
-				continue
-			}
-
-			go func() {
-				var buf [1024]byte
-				for {
-					start := time.Now()
-					size, err := conn.Read(buf[:])
-					if err != nil {
-						log.Printf("conn.read: %v", err)
-						conn.Close()
-						forwardConn.Close()
-						return
-					}
-
-					_, err = forwardConn.Write(buf[0:size])
-					if err != nil {
-						log.Printf("forwardConn.write: %v", err)
-						conn.Close()
-						forwardConn.Close()
-						return
-					}
-
-					delay(throughput, size, time.Since(start))
-				}
-			}()
-
-			go func() {
-				var buf [1024]byte
-				for {
-					start := time.Now()
-					size, err := forwardConn.Read(buf[:])
-					if err != nil {
-						log.Printf("forwardConn.read: %v", err)
-						conn.Close()
-						forwardConn.Close()
-						return
-					}
-
-					_, err = conn.Write(buf[0:size])
-					if err != nil {
-						log.Printf("conn.write: %v", err)
-						conn.Close()
-						forwardConn.Close()
-						return
-					}
-
-					delay(throughput, size, time.Since(start))
-				}
-			}()
-		}
-	}()
+	go acceptConnections(listener, shutdown, forward, throughput)
 
 	<-shutdown
 	err = listener.Close()
 	if err != nil {
 		log.Printf("close: %v", err)
 	}
+}
+
+func acceptConnections(listener net.Listener, shutdown chan os.Signal, forward string, throughput int) {
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			log.Printf("accept: %v", err)
+			shutdown <- nil
+			return
+		}
+
+		handleConnection(conn, forward, throughput)
+	}
+}
+
+func handleConnection(conn net.Conn, forward string, throughput int) {
+	// set the buffer size to the throughput (bytes/second) because it does not make sense to read more than
+	// one second worth of data ahead
+	bufSize := throughput
+
+	if connTcp, ok := conn.(*net.TCPConn); ok {
+		connTcp.SetReadBuffer(bufSize)
+		connTcp.SetWriteBuffer(bufSize)
+	} else {
+		panic(fmt.Sprint("non-TCPConn connection: ", conn))
+	}
+
+	forwardConn, err := net.Dial("tcp", forward)
+	if err != nil {
+		log.Printf("dial: %v", err)
+		if err := conn.Close(); err != nil {
+			log.Printf("conn.close: %v", err)
+		}
+		return
+	}
+	if connTcp, ok := forwardConn.(*net.TCPConn); ok {
+		connTcp.SetReadBuffer(bufSize)
+		connTcp.SetWriteBuffer(bufSize)
+	} else {
+		panic(fmt.Sprint("non-TCPConn connection: ", forwardConn))
+	}
+
+	go func() {
+		buf := make([]byte, bufSize, bufSize)
+		for {
+			start := time.Now()
+			size, err := conn.Read(buf)
+			if err != nil {
+				log.Printf("conn.read: %v", err)
+				conn.Close()
+				forwardConn.Close()
+				return
+			}
+
+			_, err = forwardConn.Write(buf[0:size])
+			if err != nil {
+				log.Printf("forwardConn.write: %v", err)
+				conn.Close()
+				forwardConn.Close()
+				return
+			}
+
+			delay(throughput, size, time.Since(start))
+		}
+	}()
+
+	go func() {
+		buf := make([]byte, bufSize, bufSize)
+		for {
+			start := time.Now()
+			size, err := forwardConn.Read(buf)
+			if err != nil {
+				log.Printf("forwardConn.read: %v", err)
+				conn.Close()
+				forwardConn.Close()
+				return
+			}
+
+			_, err = conn.Write(buf[0:size])
+			if err != nil {
+				log.Printf("conn.write: %v", err)
+				conn.Close()
+				forwardConn.Close()
+				return
+			}
+
+			delay(throughput, size, time.Since(start))
+		}
+	}()
 }
 
 func delay(throughput, size int, actualDelay time.Duration) {
